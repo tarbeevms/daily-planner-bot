@@ -37,32 +37,45 @@ const (
 
 const (
 	cbCompletePrefix = "complete:"
+	cbDeletePrefix   = "delete:"
 	cbConfirmPrefix  = "confirm:"
 	cbCancelPrefix   = "cancel:"
 )
 
 const (
-	btnSkip             = "Пропустить"
+	btnSkip             = "⏭️ Пропустить"
 	btnYes              = "Да"
 	btnNo               = "Нет"
-	btnConfirm          = "Подтвердить"
-	btnCancel           = "Отмена"
-	btnCancelDialog     = "Отменить"
-	noCategory          = "Без раздела"
+	btnConfirm          = "✅ Подтвердить"
+	btnCancel           = "↩️ Отмена"
+	btnCancelDialog     = "⏪ Отменить ввод"
+	noCategory          = "Без категории"
 	noCategoryKey       = "__no_category__"
 	iconDefault         = "🟢"
-	iconDue             = "🟠"
-	iconOverdue         = "🔴"
-	iconRecurring       = "🔁"
-	menuLabelNewTask    = "Новая задача"
-	menuLabelTasks      = "Задачи"
-	menuLabelCategories = "Категории"
-	menuLabelHelp       = "Помощь"
+	iconDue             = "⏳"
+	iconOverdue         = "⚠️"
+	iconRecurring       = "♻️"
+	menuLabelNewTask    = "➕ Новая задача"
+	menuLabelTasks      = "📋 Задачи"
+	menuLabelCategories = "📂 Категории"
+	menuLabelHelp       = "ℹ️ Помощь"
 )
 
 type conversationState struct {
 	stage conversationStage
 	input service.TaskInput
+}
+
+type confirmationAction int
+
+const (
+	actionComplete confirmationAction = iota
+	actionDelete
+)
+
+type confirmationRequest struct {
+	taskID uint
+	action confirmationAction
 }
 
 // Bot aggregates Telegram API with services.
@@ -74,7 +87,7 @@ type Bot struct {
 	reminderSvc   *service.ReminderService
 	config        *config.Config
 	conversations map[int64]*conversationState
-	confirmations map[int64]uint
+	confirmations map[int64]confirmationRequest
 	mu            sync.Mutex
 }
 
@@ -94,7 +107,7 @@ func New(token string, userRepo *repository.UserRepository, categorySvc *service
 		reminderSvc:   reminderSvc,
 		config:        cfg,
 		conversations: make(map[int64]*conversationState),
-		confirmations: make(map[int64]uint),
+		confirmations: make(map[int64]confirmationRequest),
 	}, nil
 }
 
@@ -138,11 +151,11 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) error {
 	if !msg.IsCommand() && isCancelDialogInput(msg.Text) {
 		b.clearConversation(msg.From.ID)
 		b.clearConfirmation(msg.From.ID)
-		return b.sendText(msg.Chat.ID, "Диалог создания задачи отменен.")
+		return b.sendText(msg.Chat.ID, "⏪ Диалог создания задачи отменён. Я здесь, чтобы начать заново.")
 	}
 
 	if !msg.IsCommand() {
-		if handled, err := b.handleMenuAlias(msg); handled {
+		if handled, err := b.handleMenuAlias(ctx, msg); handled {
 			return err
 		}
 	}
@@ -161,65 +174,96 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) error {
 		return b.handleConversation(ctx, msg)
 	}
 
-	return b.sendText(msg.Chat.ID, "Не понял сообщение. Используйте /newtask для добавления задачи или /help для списка команд.")
+	return b.sendText(msg.Chat.ID, "Я пока не понял сообщение. Набери /newtask, чтобы добавить задачу, или /help для списка команд.")
 }
 
 func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) error {
 	switch msg.Command() {
 	case "start":
-		return b.handleStart(msg)
+		return b.handleStartV2(ctx, msg)
 	case "help":
-		return b.handleHelp(msg)
+		return b.handleHelpV3(msg)
+	case "report":
+		return b.handleReport(ctx, msg)
+	case "delete":
+		return b.handleDelete(ctx, msg)
 	case "newtask":
-		return b.startNewTaskConversation(msg)
+		return b.startNewTaskConversation(ctx, msg)
 	case "tasks":
-		return b.handleListTasks(msg)
+		return b.handleListTasks(ctx, msg)
 	case "complete":
-		return b.handleComplete(msg)
+		return b.handleComplete(ctx, msg)
 	case "categories":
-		return b.handleCategories(msg)
+		return b.handleCategories(ctx, msg)
 	case "interval":
 		return b.handleInterval(msg)
 	case "cancel":
 		b.clearConversation(msg.From.ID)
-		return b.sendText(msg.Chat.ID, "Диалог создания задачи отменен.")
+		return b.sendText(msg.Chat.ID, "⏪ Диалог создания задачи отменён.")
 	default:
-		return b.sendText(msg.Chat.ID, "Команда не поддерживается. Посмотрите /help.")
+		return b.sendText(msg.Chat.ID, "Команда не поддерживается. Загляни в /help.")
 	}
 }
 
-func (b *Bot) handleStart(msg *tgbotapi.Message) error {
-	if _, err := b.ensureUser(msg.From); err != nil {
+// Новые варианты /start, /help и тестового отчёта.
+func (b *Bot) handleStartV2(ctx context.Context, msg *tgbotapi.Message) error {
+	if _, err := b.ensureUser(ctx, msg.From); err != nil {
 		return err
 	}
-	text := "Привет! Я бот-ежедневник. Доступные команды:\n" +
-		"/newtask — создать новую задачу\n" +
-		"/tasks — показать активные задачи\n" +
-		"/complete <id> — отметить задачу выполненной\n" +
-		"/categories — показать разделы\n" +
-		"/help — справка\n" +
-		"/cancel — отменить создание задачи"
+
+	name := strings.TrimSpace(msg.From.FirstName)
+	if name == "" {
+		name = "друг"
+	}
+
+	text := fmt.Sprintf(
+		"👋 Привет, %s!\n<b>Я ежедневный планировщик: помогу не забыть задачи.</b>\n\nКоманды:\n"+
+			"• /newtask — добавить новую задачу\n"+
+			"• /tasks — показать текущие задачи\n"+
+			"• /complete &lt;id&gt; — отметить задачу выполненной\n"+
+			"• /categories — список категорий\n"+
+			"• /interval &lt;часы&gt; — интервал отчётов\n"+
+			"• /report — тестовый ежедневный отчёт\n"+
+			"• /help — подсказки\n"+
+			"• /cancel — отменить текущий ввод",
+		escape(name),
+	)
+
 	return b.sendText(msg.Chat.ID, text)
 }
 
-func (b *Bot) handleHelp(msg *tgbotapi.Message) error {
-	text := "Команды:\n" +
-		"/newtask — добавить задачу через диалог\n" +
-		"/tasks — список активных задач\n" +
-		"/complete <id> — отметить задачу выполненной (для регулярных задач фиксирует выполнение в текущем окне)\n" +
-		"/categories — список ваших разделов\n" +
-		"/interval <часы> — настроить периодичность напоминаний (по умолчанию 5 часов)\n" +
-		"/cancel — отменить текущий диалог"
+func (b *Bot) handleHelpV3(msg *tgbotapi.Message) error {
+	text := "ℹ️ <b>Подсказки</b>\n" +
+		"• /newtask — добавить задачу пошагово\n" +
+		"• /tasks — показать активные задачи и завершить по кнопке\n" +
+		"• /complete &lt;id&gt; — отметить задачу по номеру (например, /complete 3)\n" +
+		"• /delete &lt;id&gt; — удалить задачу полностью\n" +
+		"• /categories — посмотреть доступные категории\n" +
+		"• /interval &lt;часы&gt; — как часто присылать отчёт (по умолчанию 5 часов)\n" +
+		"• /report — отправить тестовый ежедневный отчёт\n" +
+		"• /cancel — отменить текущий ввод"
 	return b.sendText(msg.Chat.ID, text)
 }
 
-func (b *Bot) startNewTaskConversation(msg *tgbotapi.Message) error {
-	if _, err := b.ensureUser(msg.From); err != nil {
+func (b *Bot) handleReport(ctx context.Context, msg *tgbotapi.Message) error {
+	user, err := b.ensureUser(ctx, msg.From)
+	if err != nil {
+		return err
+	}
+	text, err := b.reminderSvc.DailySummary(ctx, *user, time.Now())
+	if err != nil {
+		return b.sendText(msg.Chat.ID, fmt.Sprintf("Не удалось сформировать отчёт: %s", escape(err.Error())))
+	}
+	return b.sendText(msg.Chat.ID, text)
+}
+
+func (b *Bot) startNewTaskConversation(ctx context.Context, msg *tgbotapi.Message) error {
+	if _, err := b.ensureUser(ctx, msg.From); err != nil {
 		return err
 	}
 	log.Printf("[info] start new task conversation user=%d", msg.From.ID)
 	b.setConversation(msg.From.ID, &conversationState{stage: stageTitle})
-	return b.sendWithReplyMarkup(msg.Chat.ID, "Введите название задачи:", cancelKeyboard())
+	return b.sendWithReplyMarkup(msg.Chat.ID, "🆕 Создаём новую задачу.\n<b>Шаг 1:</b> как её назвать?", cancelKeyboard())
 }
 
 func (b *Bot) handleConversation(ctx context.Context, msg *tgbotapi.Message) error {
@@ -233,35 +277,35 @@ func (b *Bot) handleConversation(ctx context.Context, msg *tgbotapi.Message) err
 	case stageTitle:
 		state.input.Title = text
 		state.stage = stageDescription
-		return b.sendWithReplyMarkup(msg.Chat.ID, "Добавьте описание:", skipKeyboard())
+		return b.sendWithReplyMarkup(msg.Chat.ID, "✏️ Добавь короткое описание (или нажми «Пропустить»).", skipKeyboard())
 	case stageDescription:
 		if !isSkipInput(text) {
 			state.input.Description = text
 		}
 		state.stage = stageCategory
-		return b.sendWithReplyMarkup(msg.Chat.ID, "Укажите раздел (например, Работа, Здоровье):", categoryKeyboard())
+		return b.sendWithReplyMarkup(msg.Chat.ID, "🏷 Выбери категорию или отправь свою (можно «Пропустить»).", categoryKeyboard())
 	case stageCategory:
 		if !isSkipInput(text) {
 			state.input.Category = text
 		}
 		state.stage = stageDeadline
-		return b.sendWithReplyMarkup(msg.Chat.ID, "Введите дедлайн в формате ГГГГ-ММ-ДД:", skipKeyboard())
+		return b.sendWithReplyMarkup(msg.Chat.ID, "⏰ Укажи дедлайн в формате <code>2025-11-30</code> (или «Пропустить»).", skipKeyboard())
 	case stageDeadline:
 		if !isSkipInput(text) {
 			parsed, err := time.Parse("2006-01-02", text)
 			if err != nil {
-				return b.sendWithReplyMarkup(msg.Chat.ID, "Не удалось разобрать дату. Используйте формат ГГГГ-ММ-ДД или нажмите \"Пропустить\".", skipKeyboard())
+				return b.sendWithReplyMarkup(msg.Chat.ID, "Не могу распознать дату. Используй формат <code>2025-11-30</code> или «Пропустить».", skipKeyboard())
 			}
 			state.input.Deadline = &parsed
 		}
 		state.stage = stageRecurring
-		return b.sendWithReplyMarkup(msg.Chat.ID, "Сделать задачу ежемесячной?", yesNoKeyboard())
+		return b.sendWithReplyMarkup(msg.Chat.ID, "🔁 Сделать задачу повторяющейся каждый месяц?", yesNoKeyboard())
 	case stageRecurring:
 		lower := strings.ToLower(text)
 		if lower == "да" || lower == "yes" || lower == "y" {
 			state.input.IsRecurring = true
 			state.stage = stageRecurringDay
-			return b.sendWithReplyMarkup(msg.Chat.ID, "Укажите день месяца (1-31), когда задача должна быть сделана:", tgbotapi.NewRemoveKeyboard(true))
+			return b.sendWithReplyMarkup(msg.Chat.ID, "📆 В какой день месяца напоминать? (1–31). Если числа нет в месяце, возьмём последний день.", tgbotapi.NewRemoveKeyboard(true))
 		}
 		if lower == "нет" || lower == "no" || lower == "n" || lower == "-" {
 			state.input.IsRecurring = false
@@ -269,15 +313,15 @@ func (b *Bot) handleConversation(ctx context.Context, msg *tgbotapi.Message) err
 			b.clearConversation(msg.From.ID)
 			return err
 		}
-		return b.sendWithReplyMarkup(msg.Chat.ID, "Ответьте \"Да\" или \"Нет\".", yesNoKeyboard())
+		return b.sendWithReplyMarkup(msg.Chat.ID, "Нажми «Да» или «Нет».", yesNoKeyboard())
 	case stageRecurringDay:
 		day, err := strconv.Atoi(text)
 		if err != nil || day < 1 || day > 31 {
-			return b.sendText(msg.Chat.ID, "День месяца должен быть числом от 1 до 31.")
+			return b.sendText(msg.Chat.ID, "День должен быть числом от 1 до 31.")
 		}
 		state.input.RecurDay = day
 		state.stage = stageRecurringWindow
-		return b.sendWithReplyMarkup(msg.Chat.ID, "Сколько дней окно для выполнения вокруг даты? (например, 2):", tgbotapi.NewRemoveKeyboard(true))
+		return b.sendWithReplyMarkup(msg.Chat.ID, "⏳ Сколько дней до/после даты считать окном выполнения? (например, 2)", tgbotapi.NewRemoveKeyboard(true))
 	case stageRecurringWindow:
 		window, err := strconv.Atoi(text)
 		if err != nil || window < 0 || window > 14 {
@@ -289,123 +333,133 @@ func (b *Bot) handleConversation(ctx context.Context, msg *tgbotapi.Message) err
 		return err
 	default:
 		b.clearConversation(msg.From.ID)
-		return b.sendText(msg.Chat.ID, "Диалог сброшен. Начните заново через /newtask.")
+		return b.sendText(msg.Chat.ID, "Диалог сброшен. Попробуй ещё раз через /newtask.")
 	}
 }
 
 func (b *Bot) finishTaskCreation(ctx context.Context, from *tgbotapi.User, input service.TaskInput, chatID int64) error {
-	user, err := b.ensureUser(from)
+	user, err := b.ensureUser(ctx, from)
 	if err != nil {
 		return err
 	}
 
-	task, err := b.taskSvc.CreateTask(user, input)
+	task, err := b.taskSvc.CreateTask(ctx, user, input)
 	if err != nil {
-		return b.sendText(chatID, fmt.Sprintf("Не удалось создать задачу: %v", err))
+		return b.sendText(chatID, fmt.Sprintf("Не удалось сохранить задачу: %s", escape(err.Error())))
 	}
 
 	log.Printf("[info] task created id=%d user=%d recurring=%t", task.ID, user.ID, task.IsRecurring)
 
 	var summary strings.Builder
-	summary.WriteString("✅ Задача создана\n")
-	summary.WriteString(fmt.Sprintf("ID: %d\n", task.ID))
-	summary.WriteString(fmt.Sprintf("Название: %s\n", task.Title))
+	summary.WriteString("✅ <b>Задача сохранена</b>\n")
+	summary.WriteString(fmt.Sprintf("• <b>ID:</b> %d\n", task.ID))
+	summary.WriteString(fmt.Sprintf("• <b>Название:</b> %s\n", escape(normalizeTitle(task.Title))))
 	if task.Description != "" {
-		summary.WriteString(fmt.Sprintf("Описание: %s\n", task.Description))
+		summary.WriteString(fmt.Sprintf("• <b>Описание:</b> %s\n", escape(task.Description)))
 	}
 	if task.Deadline != nil {
-		summary.WriteString(fmt.Sprintf("Дедлайн: %s\n", task.Deadline.Format("2006-01-02")))
+		summary.WriteString(fmt.Sprintf("• <b>Дедлайн:</b> %s\n", task.Deadline.Format("2006-01-02")))
 	}
 	if task.IsRecurring {
-		summary.WriteString(fmt.Sprintf("Ежемесячно: день %d, окно ±%d дней\n", task.RecurDay, task.RecurWindow))
+		summary.WriteString(fmt.Sprintf("• <b>Повтор:</b> каждый месяц %d числа (окно +%d дн.)\n", task.RecurDay, task.RecurWindow))
 	}
 
-	msg := tgbotapi.NewMessage(chatID, summary.String())
+	msg := tgbotapi.NewMessage(chatID, strings.TrimSpace(summary.String()))
 	msg.ReplyMarkup = tgbotapi.NewRemoveKeyboard(true)
+	msg.ParseMode = tgbotapi.ModeHTML
 	if _, err := b.api.Send(msg); err != nil {
 		return err
 	}
-	return b.sendTaskList(chatID, user)
+	return b.sendTaskList(ctx, chatID, user)
 }
 
-func (b *Bot) handleListTasks(msg *tgbotapi.Message) error {
-	user, err := b.ensureUser(msg.From)
+func (b *Bot) handleListTasks(ctx context.Context, msg *tgbotapi.Message) error {
+	user, err := b.ensureUser(ctx, msg.From)
 	if err != nil {
 		return err
 	}
 
 	log.Printf("[info] list tasks for user=%d", user.ID)
-	return b.sendTaskList(msg.Chat.ID, user)
+	return b.sendTaskList(ctx, msg.Chat.ID, user)
 }
 
-func (b *Bot) handleComplete(msg *tgbotapi.Message) error {
+func (b *Bot) handleComplete(ctx context.Context, msg *tgbotapi.Message) error {
 	args := strings.TrimSpace(msg.CommandArguments())
 	if args == "" {
-		return b.sendText(msg.Chat.ID, "Укажите ID задачи: /complete 12")
+		return b.sendText(msg.Chat.ID, "Укажи ID задачи: /complete 12")
 	}
 
 	taskID64, err := strconv.ParseUint(args, 10, 64)
 	if err != nil {
-		return b.sendText(msg.Chat.ID, "ID должен быть числом.")
+		return b.sendText(msg.Chat.ID, "ID задачи должен быть числом.")
 	}
 
-	user, err := b.ensureUser(msg.From)
+	user, err := b.ensureUser(ctx, msg.From)
 	if err != nil {
 		return err
 	}
 
-	task, err := b.taskSvc.CompleteTask(user, uint(taskID64), time.Now())
+	task, err := b.taskSvc.CompleteTask(ctx, user, uint(taskID64), time.Now())
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return b.sendText(msg.Chat.ID, "Задача не найдена.")
 		}
-		return b.sendText(msg.Chat.ID, fmt.Sprintf("Ошибка: %v", err))
+		return b.sendText(msg.Chat.ID, fmt.Sprintf("Ошибка: %s", escape(err.Error())))
 	}
 
 	if task.IsRecurring {
-		return b.sendText(msg.Chat.ID, fmt.Sprintf("Отметил выполнение регулярной задачи \"%s\" для текущего окна.", task.Title))
+		return b.sendText(msg.Chat.ID, fmt.Sprintf("✅ Повторяющаяся задача «%s» отмечена выполненной в этом окне.", escape(normalizeTitle(task.Title))))
 	}
 
-	return b.sendText(msg.Chat.ID, fmt.Sprintf("Задача \"%s\" отмечена как выполненная.", task.Title))
+	return b.sendText(msg.Chat.ID, fmt.Sprintf("✅ Задача «%s» выполнена.", escape(normalizeTitle(task.Title))))
 }
 
-func (b *Bot) handleCategories(msg *tgbotapi.Message) error {
-	user, err := b.ensureUser(msg.From)
+func (b *Bot) handleCategories(ctx context.Context, msg *tgbotapi.Message) error {
+	user, err := b.ensureUser(ctx, msg.From)
 	if err != nil {
 		return err
 	}
-	categories, err := b.categorySvc.List(user)
+	categories, err := b.categorySvc.List(ctx, user)
 	if err != nil {
-		return b.sendText(msg.Chat.ID, fmt.Sprintf("Не удалось получить разделы: %v", err))
+		return b.sendText(msg.Chat.ID, fmt.Sprintf("Не удалось получить категории: %s", escape(err.Error())))
 	}
 	if len(categories) == 0 {
-		return b.sendText(msg.Chat.ID, "Разделы пока не созданы. Они добавляются автоматически при создании задач.")
+		return b.sendText(msg.Chat.ID, "Категории пока пусты. Добавь их при создании задачи.")
 	}
 	var builder strings.Builder
-	builder.WriteString("Ваши разделы:\n")
+	builder.WriteString("📂 <b>Категории</b>\n")
 	for _, cat := range categories {
-		builder.WriteString(fmt.Sprintf("• %s\n", cat.Name))
+		builder.WriteString(fmt.Sprintf("• %s\n", escape(strings.TrimSpace(cat.Name))))
 	}
-	return b.sendText(msg.Chat.ID, builder.String())
+	return b.sendText(msg.Chat.ID, strings.TrimSpace(builder.String()))
 }
 
-func (b *Bot) handleConfirmationResponse(ctx context.Context, msg *tgbotapi.Message, taskID uint) error {
+func (b *Bot) handleConfirmationResponse(ctx context.Context, msg *tgbotapi.Message, req confirmationRequest) error {
 	text := strings.TrimSpace(msg.Text)
 	switch {
 	case isConfirmInput(text):
 		b.clearConfirmation(msg.From.ID)
-		return b.completeTaskAndRefresh(ctx, msg.Chat.ID, msg.From, taskID)
+		if req.action == actionDelete {
+			return b.deleteTaskAndRefresh(ctx, msg.Chat.ID, msg.From, req.taskID)
+		}
+		return b.completeTaskAndRefresh(ctx, msg.Chat.ID, msg.From, req.taskID)
 	case isCancelInput(text):
 		b.clearConfirmation(msg.From.ID)
 		return b.sendMenuPlaceholder(msg.Chat.ID)
 	default:
-		return b.sendWithReplyMarkup(msg.Chat.ID, "Подтвердите или отмените действие.", confirmKeyboard())
+		var prompt string
+		if req.action == actionDelete {
+			prompt = "Подтверди или отмени удаление задачи."
+		} else {
+			prompt = "Подтверди или отмени выполнение задачи."
+		}
+		return b.sendWithReplyMarkup(msg.Chat.ID, prompt, confirmKeyboard())
 	}
 }
 
 // SendDailyReports sends a summary to every known user.
 func (b *Bot) SendDailyReports(ctx context.Context) error {
-	users, err := b.userRepo.ListAll()
+	users, err := b.userRepo.ListAll(ctx)
 	if err != nil {
 		return err
 	}
@@ -416,7 +470,7 @@ func (b *Bot) SendDailyReports(ctx context.Context) error {
 			return ctx.Err()
 		default:
 		}
-		text, err := b.reminderSvc.DailySummary(user, now)
+		text, err := b.reminderSvc.DailySummary(ctx, user, now)
 		if err != nil {
 			log.Printf("build summary for user %d: %v", user.TelegramID, err)
 			continue
@@ -436,9 +490,9 @@ func (b *Bot) handleInterval(msg *tgbotapi.Message) error {
 	if args == "" {
 		current := "5 часов"
 		if b.config != nil && b.config.ReportInterval > 0 {
-			current = b.config.ReportInterval.String()
+			current = fmt.Sprintf("%d часов", int(b.config.ReportInterval.Hours()))
 		}
-		return b.sendText(msg.Chat.ID, fmt.Sprintf("Текущий интервал напоминаний: %s. Укажите число часов, например: /interval 4", current))
+		return b.sendText(msg.Chat.ID, fmt.Sprintf("Текущий интервал отчётов: %s. Укажи число часов, например: /interval 4", current))
 	}
 	hours, err := strconv.Atoi(args)
 	if err != nil || hours <= 0 {
@@ -447,15 +501,16 @@ func (b *Bot) handleInterval(msg *tgbotapi.Message) error {
 	b.mu.Lock()
 	b.config.ReportInterval = time.Duration(hours) * time.Hour
 	b.mu.Unlock()
-	return b.sendText(msg.Chat.ID, fmt.Sprintf("Интервал напоминаний обновлен: каждые %d часов.", hours))
+	return b.sendText(msg.Chat.ID, fmt.Sprintf("Интервал уведомлений обновлён: каждые %d часов.", hours))
 }
 
-func (b *Bot) ensureUser(from *tgbotapi.User) (*model.User, error) {
-	return b.userRepo.UpsertFromTelegram(from.ID, from.FirstName, from.LastName, from.UserName)
+func (b *Bot) ensureUser(ctx context.Context, from *tgbotapi.User) (*model.User, error) {
+	return b.userRepo.UpsertFromTelegram(ctx, from.ID, from.FirstName, from.LastName, from.UserName)
 }
 
 func (b *Bot) sendText(chatID int64, text string) error {
 	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = tgbotapi.ModeHTML
 	msg.ReplyMarkup = mainMenuKeyboard()
 	_, err := b.api.Send(msg)
 	return err
@@ -463,6 +518,7 @@ func (b *Bot) sendText(chatID int64, text string) error {
 
 func (b *Bot) sendTextWithRemove(chatID int64, text string) error {
 	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = tgbotapi.ModeHTML
 	msg.ReplyMarkup = tgbotapi.NewRemoveKeyboard(true)
 	if _, err := b.api.Send(msg); err != nil {
 		return err
@@ -472,29 +528,31 @@ func (b *Bot) sendTextWithRemove(chatID int64, text string) error {
 
 func (b *Bot) sendWithReplyMarkup(chatID int64, text string, markup interface{}) error {
 	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = tgbotapi.ModeHTML
 	msg.ReplyMarkup = markup
 	_, err := b.api.Send(msg)
 	return err
 }
 
 func (b *Bot) sendMenuPlaceholder(chatID int64) error {
-	msg := tgbotapi.NewMessage(chatID, "Меню:")
+	msg := tgbotapi.NewMessage(chatID, "🔹 Главное меню")
+	msg.ParseMode = tgbotapi.ModeHTML
 	msg.ReplyMarkup = mainMenuKeyboard()
 	_, err := b.api.Send(msg)
 	return err
 }
 
-func (b *Bot) getConfirmation(userID int64) (uint, bool) {
+func (b *Bot) getConfirmation(userID int64) (confirmationRequest, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	taskID, ok := b.confirmations[userID]
-	return taskID, ok
+	req, ok := b.confirmations[userID]
+	return req, ok
 }
 
-func (b *Bot) setConfirmation(userID int64, taskID uint) {
+func (b *Bot) setConfirmation(userID int64, req confirmationRequest) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.confirmations[userID] = taskID
+	b.confirmations[userID] = req
 }
 
 func (b *Bot) clearConfirmation(userID int64) {
@@ -528,13 +586,13 @@ func (b *Bot) clearConversation(userID int64) {
 	delete(b.conversations, userID)
 }
 
-func (b *Bot) sendTaskList(chatID int64, user *model.User) error {
-	tasks, err := b.taskSvc.ListActive(user)
+func (b *Bot) sendTaskList(ctx context.Context, chatID int64, user *model.User) error {
+	tasks, err := b.taskSvc.ListActive(ctx, user)
 	if err != nil {
-		return b.sendText(chatID, fmt.Sprintf("Не удалось получить задачи: %v", err))
+		return b.sendText(chatID, fmt.Sprintf("Не удалось получить задачи: %s", escape(err.Error())))
 	}
 
-	categories, _ := b.categorySvc.List(user)
+	categories, _ := b.categorySvc.List(ctx, user)
 	catNames := make(map[uint]string)
 	for _, cat := range categories {
 		catNames[cat.ID] = cat.Name
@@ -564,7 +622,7 @@ func (b *Bot) sendTaskList(chatID int64, user *model.User) error {
 	}
 
 	if len(groups) == 0 {
-		return b.sendText(chatID, "Нет активных задач. Создайте новую через /newtask.")
+		return b.sendText(chatID, "У тебя нет активных задач. Добавь новую через /newtask.")
 	}
 
 	sort.Slice(order, func(i, j int) bool {
@@ -578,7 +636,8 @@ func (b *Bot) sendTaskList(chatID int64, user *model.User) error {
 	})
 
 	var builder strings.Builder
-	builder.WriteString("<b>Активные задачи:</b>\n\n")
+	builder.WriteString("📋 <b>Текущие задачи</b>\n")
+	builder.WriteString("Нажми на кнопку, чтобы отметить задачу выполненной или удалить повторяющуюся.\n\n")
 
 	var buttons [][]tgbotapi.InlineKeyboardButton
 	for _, key := range order {
@@ -601,26 +660,25 @@ func (b *Bot) sendTaskList(chatID int64, user *model.User) error {
 			return a.ID < b.ID
 		})
 
-		builder.WriteString(fmt.Sprintf("%s\n", section.Name))
+		builder.WriteString(fmt.Sprintf("<b>%s</b>\n", section.Name))
 		for _, task := range section.Tasks {
+			var row []tgbotapi.InlineKeyboardButton
 			if task.IsRecurring {
 				builder.WriteString(formatRecurringTask(task, now))
-				buttons = append(buttons, []tgbotapi.InlineKeyboardButton{
-					tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("✅ [%d] %s", task.ID, shortTitle(normalizeTitle(task.Title), 20)), fmt.Sprintf("%s%d", cbCompletePrefix, task.ID)),
-				})
+				row = append(row, tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("\u2705 #%d · %s", task.ID, shortTitle(task.Title, 20)), fmt.Sprintf("%s%d", cbCompletePrefix, task.ID)))
+				row = append(row, tgbotapi.NewInlineKeyboardButtonData("\U0001F5D1 Удалить", fmt.Sprintf("%s%d", cbDeletePrefix, task.ID)))
 			} else {
 				builder.WriteString(formatTask(task, now))
-				buttons = append(buttons, []tgbotapi.InlineKeyboardButton{
-					tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("✅ [%d] %s", task.ID, shortTitle(normalizeTitle(task.Title), 24)), fmt.Sprintf("%s%d", cbCompletePrefix, task.ID)),
-				})
+				row = append(row, tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("\u2705 #%d · %s", task.ID, shortTitle(task.Title, 24)), fmt.Sprintf("%s%d", cbCompletePrefix, task.ID)))
 			}
+			buttons = append(buttons, row)
 		}
 		builder.WriteByte('\n')
 	}
 
 	msg := tgbotapi.NewMessage(chatID, strings.TrimSpace(builder.String()))
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons...)
-	msg.ParseMode = "HTML"
+	msg.ParseMode = tgbotapi.ModeHTML
 	_, err = b.api.Send(msg)
 	return err
 }
@@ -643,6 +701,16 @@ func (b *Bot) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) er
 			return nil
 		}
 		return b.askCompleteConfirmation(ctx, cb.Message.Chat.ID, cb.From, taskID)
+	case strings.HasPrefix(data, cbDeletePrefix):
+		log.Printf("[info] callback delete request user=%d task=%s", cb.From.ID, strings.TrimPrefix(data, cbDeletePrefix))
+		if _, err := b.api.Request(tgbotapi.NewCallback(cb.ID, "")); err != nil {
+			log.Printf("callback ack: %v", err)
+		}
+		taskID, err := parseTaskID(data, cbDeletePrefix)
+		if err != nil {
+			return nil
+		}
+		return b.askDeleteConfirmation(ctx, cb.Message.Chat.ID, cb.From, taskID)
 	case strings.HasPrefix(data, cbConfirmPrefix):
 		log.Printf("[info] callback confirm complete user=%d task=%s", cb.From.ID, strings.TrimPrefix(data, cbConfirmPrefix))
 		if _, err := b.api.Request(tgbotapi.NewCallback(cb.ID, "")); err != nil {
@@ -668,12 +736,12 @@ func (b *Bot) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) er
 }
 
 func (b *Bot) askCompleteConfirmation(ctx context.Context, chatID int64, from *tgbotapi.User, taskID uint) error {
-	user, err := b.ensureUser(from)
+	user, err := b.ensureUser(ctx, from)
 	if err != nil {
 		return err
 	}
 
-	task, err := b.taskSvc.GetTask(user, taskID)
+	task, err := b.taskSvc.GetTask(ctx, user, taskID)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return b.sendText(chatID, "Задача не найдена.")
@@ -683,59 +751,104 @@ func (b *Bot) askCompleteConfirmation(ctx context.Context, chatID int64, from *t
 
 	if task.IsRecurring {
 		if isRecurringDoneInWindow(*task, time.Now()) {
-			return b.sendText(chatID, "Задача уже отмечена выполненной в текущем окне.")
+			return b.sendText(chatID, "Задача уже отмечена выполненной в этом окне.")
 		}
 	} else if task.IsCompleted {
-		return b.sendText(chatID, "Задача уже завершена.")
+		return b.sendText(chatID, "Задача уже выполнена.")
 	}
 
-	text := fmt.Sprintf("Отметить задачу \"%s\" (#%d) как выполненную?", task.Title, task.ID)
-	b.setConfirmation(from.ID, task.ID)
+	text := fmt.Sprintf("Отметить задачу «%s» (#%d) как выполненную?", escape(normalizeTitle(task.Title)), task.ID)
+	b.setConfirmation(from.ID, confirmationRequest{taskID: task.ID, action: actionComplete})
 	return b.sendWithReplyMarkup(chatID, text, confirmKeyboard())
 }
 
-func (b *Bot) completeTaskAndRefresh(ctx context.Context, chatID int64, from *tgbotapi.User, taskID uint) error {
-	user, err := b.ensureUser(from)
+func (b *Bot) askDeleteConfirmation(ctx context.Context, chatID int64, from *tgbotapi.User, taskID uint) error {
+	user, err := b.ensureUser(ctx, from)
 	if err != nil {
 		return err
 	}
 
-	task, err := b.taskSvc.GetTask(user, taskID)
+	task, err := b.taskSvc.GetTask(ctx, user, taskID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return b.sendText(chatID, "Задача не найдена.")
+		}
+		return err
+	}
+
+	text := fmt.Sprintf("Удалить задачу \"%s\" (#%d)?", escape(normalizeTitle(task.Title)), task.ID)
+	b.setConfirmation(from.ID, confirmationRequest{taskID: task.ID, action: actionDelete})
+	return b.sendWithReplyMarkup(chatID, text, confirmKeyboard())
+}
+
+func (b *Bot) completeTaskAndRefresh(ctx context.Context, chatID int64, from *tgbotapi.User, taskID uint) error {
+	user, err := b.ensureUser(ctx, from)
+	if err != nil {
+		return err
+	}
+
+	task, err := b.taskSvc.GetTask(ctx, user, taskID)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return b.sendTextWithRemove(chatID, "Задача не найдена или уже удалена.")
 		}
-		return b.sendTextWithRemove(chatID, fmt.Sprintf("Ошибка: %v", err))
+		return b.sendTextWithRemove(chatID, fmt.Sprintf("Ошибка: %s", escape(err.Error())))
 	}
 
 	now := time.Now()
 	if task.IsRecurring && isRecurringDoneInWindow(*task, now) {
-		return b.sendTextWithRemove(chatID, "Задача уже отмечена выполненной в текущем окне.")
+		return b.sendTextWithRemove(chatID, "Эта повторяющаяся задача уже закрыта в текущем окне.")
 	}
 	if !task.IsRecurring && task.IsCompleted {
-		return b.sendTextWithRemove(chatID, "Задача уже завершена.")
+		return b.sendTextWithRemove(chatID, "Задача уже была выполнена.")
 	}
 
-	task, err = b.taskSvc.CompleteTask(user, taskID, now)
+	task, err = b.taskSvc.CompleteTask(ctx, user, taskID, now)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return b.sendTextWithRemove(chatID, "Задача не найдена или уже удалена.")
 		}
-		return b.sendTextWithRemove(chatID, fmt.Sprintf("Ошибка: %v", err))
+		return b.sendTextWithRemove(chatID, fmt.Sprintf("Ошибка: %s", escape(err.Error())))
 	}
 
 	var info string
 	if task.IsRecurring {
-		info = fmt.Sprintf("Отметил регулярную задачу \"%s\" для текущего окна.", task.Title)
+		info = fmt.Sprintf("♻️ Задача «%s» отмечена выполненной в этом окне.", escape(normalizeTitle(task.Title)))
 	} else {
-		info = fmt.Sprintf("Задача \"%s\" отмечена как выполненная.", task.Title)
+		info = fmt.Sprintf("✅ Задача «%s» выполнена.", escape(normalizeTitle(task.Title)))
 	}
 	log.Printf("[info] task completed id=%d user=%d recurring=%t", task.ID, user.ID, task.IsRecurring)
 	if err := b.sendTextWithRemove(chatID, info); err != nil {
 		return err
 	}
 
-	return b.sendTaskList(chatID, user)
+	return b.sendTaskList(ctx, chatID, user)
+}
+
+func (b *Bot) deleteTaskAndRefresh(ctx context.Context, chatID int64, from *tgbotapi.User, taskID uint) error {
+	user, err := b.ensureUser(ctx, from)
+	if err != nil {
+		return err
+	}
+
+	task, err := b.taskSvc.GetTask(ctx, user, taskID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return b.sendTextWithRemove(chatID, "Задача не найдена или уже удалена.")
+		}
+		return b.sendTextWithRemove(chatID, fmt.Sprintf("Ошибка: %s", escape(err.Error())))
+	}
+
+	if err := b.taskSvc.DeleteTask(ctx, user, taskID); err != nil {
+		return b.sendTextWithRemove(chatID, fmt.Sprintf("Ошибка: %s", escape(err.Error())))
+	}
+
+	log.Printf("[info] task deleted id=%d user=%d", task.ID, user.ID)
+	if err := b.sendTextWithRemove(chatID, fmt.Sprintf("\U0001F5D1 Задача \"%s\" удалена.", escape(normalizeTitle(task.Title)))); err != nil {
+		return err
+	}
+
+	return b.sendTaskList(ctx, chatID, user)
 }
 
 func parseTaskID(data, prefix string) (uint, error) {
@@ -747,25 +860,62 @@ func parseTaskID(data, prefix string) (uint, error) {
 	return uint(value), nil
 }
 
-func shortTitle(title string, maxLen int) string {
-	runes := []rune(title)
-	if len(runes) <= maxLen {
-		return title
+// handleDelete удаляет задачу полностью (включая повторяющиеся).
+func (b *Bot) handleDelete(ctx context.Context, msg *tgbotapi.Message) error {
+	args := strings.TrimSpace(msg.CommandArguments())
+	if args == "" {
+		return b.sendText(msg.Chat.ID, "Укажи ID задачи: /delete 12")
 	}
-	return string(runes[:maxLen]) + "…"
+
+	taskID64, err := strconv.ParseUint(args, 10, 64)
+	if err != nil {
+		return b.sendText(msg.Chat.ID, "ID задачи должен быть числом.")
+	}
+
+	user, err := b.ensureUser(ctx, msg.From)
+	if err != nil {
+		return err
+	}
+
+	task, err := b.taskSvc.GetTask(ctx, user, uint(taskID64))
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return b.sendText(msg.Chat.ID, "Задача не найдена.")
+		}
+		return b.sendText(msg.Chat.ID, fmt.Sprintf("Ошибка: %s", escape(err.Error())))
+	}
+
+	if err := b.taskSvc.DeleteTask(ctx, user, uint(taskID64)); err != nil {
+		return b.sendText(msg.Chat.ID, fmt.Sprintf("Не удалось удалить задачу: %s", escape(err.Error())))
+	}
+
+	return b.sendText(msg.Chat.ID, fmt.Sprintf("🗑 Задача \"%s\" удалена.", escape(normalizeTitle(task.Title))))
 }
 
-func (b *Bot) handleMenuAlias(msg *tgbotapi.Message) (bool, error) {
+func shortTitle(title string, maxLen int) string {
+	clean := strings.TrimSpace(strings.ReplaceAll(title, "\n", " "))
+	clean = normalizeTitle(clean)
+	runes := []rune(clean)
+	if len(runes) <= maxLen {
+		return clean
+	}
+	if maxLen <= 1 {
+		return string(runes[:maxLen])
+	}
+	return string(runes[:maxLen-1]) + "…"
+}
+
+func (b *Bot) handleMenuAlias(ctx context.Context, msg *tgbotapi.Message) (bool, error) {
 	text := strings.TrimSpace(strings.ToLower(msg.Text))
 	switch text {
 	case strings.ToLower(menuLabelNewTask):
-		return true, b.startNewTaskConversation(msg)
+		return true, b.startNewTaskConversation(ctx, msg)
 	case strings.ToLower(menuLabelTasks):
-		return true, b.handleListTasks(msg)
+		return true, b.handleListTasks(ctx, msg)
 	case strings.ToLower(menuLabelCategories):
-		return true, b.handleCategories(msg)
+		return true, b.handleCategories(ctx, msg)
 	case strings.ToLower(menuLabelHelp):
-		return true, b.handleHelp(msg)
+		return true, b.handleHelpV3(msg)
 	default:
 		return false, nil
 	}
@@ -842,11 +992,11 @@ func categoryKeyboard() tgbotapi.ReplyKeyboardMarkup {
 	kb := tgbotapi.NewReplyKeyboard(
 		tgbotapi.NewKeyboardButtonRow(
 			tgbotapi.NewKeyboardButton("Учеба"),
-			tgbotapi.NewKeyboardButton("Здоровье"),
+			tgbotapi.NewKeyboardButton("Работа"),
 		),
 		tgbotapi.NewKeyboardButtonRow(
-			tgbotapi.NewKeyboardButton("Работа"),
 			tgbotapi.NewKeyboardButton("Покупки"),
+			tgbotapi.NewKeyboardButton("Здоровье"),
 		),
 		tgbotapi.NewKeyboardButtonRow(
 			tgbotapi.NewKeyboardButton(btnSkip),
@@ -860,22 +1010,22 @@ func categoryKeyboard() tgbotapi.ReplyKeyboardMarkup {
 
 func isSkipInput(text string) bool {
 	value := strings.TrimSpace(strings.ToLower(text))
-	return value == "-" || value == strings.ToLower(btnSkip) || value == "skip"
+	return value == "-" || value == strings.ToLower(btnSkip) || value == "пропустить" || value == "skip"
 }
 
 func isConfirmInput(text string) bool {
 	value := strings.TrimSpace(strings.ToLower(text))
-	return value == strings.ToLower(btnConfirm)
+	return value == strings.ToLower(btnConfirm) || value == "подтвердить" || value == "да"
 }
 
 func isCancelInput(text string) bool {
 	value := strings.TrimSpace(strings.ToLower(text))
-	return value == strings.ToLower(btnCancel)
+	return value == strings.ToLower(btnCancel) || value == "отмена"
 }
 
 func isCancelDialogInput(text string) bool {
 	value := strings.TrimSpace(strings.ToLower(text))
-	return value == strings.ToLower(btnCancelDialog)
+	return value == strings.ToLower(btnCancelDialog) || value == "отменить ввод" || value == "отмена"
 }
 
 func isRecurringDoneInWindow(task model.Task, now time.Time) bool {
@@ -903,37 +1053,6 @@ func isRecurringDoneInWindow(task model.Task, now time.Time) bool {
 		return false
 	}
 	return true
-}
-
-func normalizeTitle(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return value
-	}
-	runes := []rune(value)
-	runes[0] = unicode.ToUpper(runes[0])
-	return string(runes)
-}
-
-func categoryLabel(name string) string {
-	base := strings.TrimSpace(name)
-	lower := strings.ToLower(base)
-	var icon string
-	switch lower {
-	case "учеба":
-		icon = "🎓"
-	case "здоровье":
-		icon = "💪"
-	case "работа":
-		icon = "💼"
-	case "покупки":
-		icon = "🛒"
-	case strings.ToLower(noCategory):
-		icon = "📁"
-	default:
-		icon = "📂"
-	}
-	return fmt.Sprintf("%s %s", icon, escape(normalizeTitle(base)))
 }
 
 func escape(s string) string {
@@ -965,17 +1084,18 @@ func formatTask(task model.Task, now time.Time) string {
 			icon = iconDue
 		}
 	}
-	b.WriteString(fmt.Sprintf("%s [%d] %s\n", icon, task.ID, escape(normalizeTitle(task.Title))))
+	b.WriteString(fmt.Sprintf("%s <b>#%d</b> %s\n", icon, task.ID, escape(normalizeTitle(task.Title))))
 	if task.Deadline != nil {
 		d := task.Deadline.In(now.Location())
 		if now.After(d) {
-			b.WriteString(fmt.Sprintf("  ⚠️ дедлайн: %s (просрочено)\n", d.Format("2006-01-02")))
+			b.WriteString(fmt.Sprintf("   ⏰ Дедлайн: %s — <b>просрочено</b>\n", d.Format("2006-01-02")))
 		} else {
-			b.WriteString(fmt.Sprintf("  📅 дедлайн: %s\n", d.Format("2006-01-02")))
+			daysLeft := int(d.Sub(now).Hours()/24) + 1
+			b.WriteString(fmt.Sprintf("   ⏰ Дедлайн: %s · осталось ≈%d дн.\n", d.Format("2006-01-02"), daysLeft))
 		}
 	}
 	if task.Description != "" {
-		b.WriteString(fmt.Sprintf("  📝 %s\n", escape(task.Description)))
+		b.WriteString(fmt.Sprintf("   📝 %s\n", escape(task.Description)))
 	}
 	b.WriteByte('\n')
 	return b.String()
@@ -983,7 +1103,7 @@ func formatTask(task model.Task, now time.Time) string {
 
 func formatRecurringTask(task model.Task, now time.Time) string {
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("%s [%d] %s\n", iconRecurring, task.ID, escape(normalizeTitle(task.Title))))
+	b.WriteString(fmt.Sprintf("%s <b>#%d</b> %s\n", iconRecurring, task.ID, escape(normalizeTitle(task.Title))))
 
 	year, month, _ := now.Date()
 	dueDay := task.RecurDay
@@ -993,12 +1113,45 @@ func formatRecurringTask(task model.Task, now time.Time) string {
 	}
 	dueDate := time.Date(year, month, dueDay, 0, 0, 0, 0, now.Location())
 
-	b.WriteString(fmt.Sprintf("  📅 дата выполнения: %s (окно ±%d дн.)\n", dueDate.Format("2006-01-02"), task.RecurWindow))
+	b.WriteString(fmt.Sprintf("   🔄 Каждый месяц: %s (окно +%d дн.)\n", dueDate.Format("2006-01-02"), task.RecurWindow))
 	if task.LastCompletedAt != nil {
-		b.WriteString(fmt.Sprintf("  🔄 последнее выполнение: %s\n", task.LastCompletedAt.In(now.Location()).Format("2006-01-02")))
+		b.WriteString(fmt.Sprintf("   ✅ Последнее выполнение: %s\n", task.LastCompletedAt.In(now.Location()).Format("2006-01-02")))
 	} else {
-		b.WriteString("  🔄 еще не выполнялась\n")
+		b.WriteString("   ✅ Пока не выполнялась\n")
 	}
 	b.WriteByte('\n')
 	return b.String()
+}
+
+func normalizeTitle(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return value
+	}
+	runes := []rune(value)
+	runes[0] = unicode.ToUpper(runes[0])
+	return string(runes)
+}
+
+func categoryLabel(name string) string {
+	base := strings.TrimSpace(name)
+	lower := strings.ToLower(base)
+	var icon string
+	switch lower {
+	case "учеба":
+		icon = "🎓"
+	case "работа":
+		icon = "💼"
+	case "покупки":
+		icon = "🛒"
+	case "здоровье":
+		icon = "🩺"
+	case "личное":
+		icon = "🧩"
+	case strings.ToLower(noCategory):
+		icon = "📁"
+	default:
+		icon = "🏷️"
+	}
+	return fmt.Sprintf("%s %s", icon, escape(normalizeTitle(base)))
 }

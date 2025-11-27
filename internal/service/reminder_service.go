@@ -1,7 +1,9 @@
 package service
 
 import (
+	"context"
 	"fmt"
+	"html"
 	"sort"
 	"strings"
 	"time"
@@ -20,13 +22,13 @@ func NewReminderService(taskRepo *repository.TaskRepository, categoryRepo *repos
 	return &ReminderService{taskRepo: taskRepo, categoryRepo: categoryRepo}
 }
 
-func (s *ReminderService) DailySummary(user model.User, now time.Time) (string, error) {
-	tasks, err := s.taskRepo.ListActiveOrRecurring(user.ID)
+func (s *ReminderService) DailySummary(ctx context.Context, user model.User, now time.Time) (string, error) {
+	tasks, err := s.taskRepo.ListActiveOrRecurring(ctx, user.ID)
 	if err != nil {
 		return "", err
 	}
 
-	categories, err := s.categoryRepo.ListByUser(user.ID)
+	categories, err := s.categoryRepo.ListByUser(ctx, user.ID)
 	if err != nil {
 		return "", err
 	}
@@ -64,18 +66,19 @@ func (s *ReminderService) DailySummary(user model.User, now time.Time) (string, 
 	})
 
 	var builder strings.Builder
-	builder.WriteString("📋 Ежедневный отчет\n\n")
+	builder.WriteString("📋 <b>Ежедневный отчёт</b>\n")
+	builder.WriteString(fmt.Sprintf("🗓 %s\n\n", now.Format("02.01.2006")))
 
-	builder.WriteString("Текущие задачи:\n")
+	builder.WriteString("🔥 <b>Текущие задачи</b>\n")
 	if len(pending) == 0 {
-		builder.WriteString("— нет активных задач\n")
+		builder.WriteString("— нет открытых задач\n")
 	} else {
 		for _, task := range pending {
-			builder.WriteString(formatTask(task, catNames))
+			builder.WriteString(formatTask(task, catNames, now))
 		}
 	}
 
-	builder.WriteString("\nРегулярные задачи этого месяца:\n")
+	builder.WriteString("\n♻️ <b>Регулярные задачи</b>\n")
 	if len(recurringDue) == 0 {
 		builder.WriteString("— нет задач в окне выполнения\n")
 	} else {
@@ -84,7 +87,7 @@ func (s *ReminderService) DailySummary(user model.User, now time.Time) (string, 
 		}
 	}
 
-	return builder.String(), nil
+	return strings.TrimSpace(builder.String()), nil
 }
 
 func (s *ReminderService) recurringDue(task model.Task, now time.Time) bool {
@@ -109,7 +112,6 @@ func (s *ReminderService) recurringDue(task model.Task, now time.Time) bool {
 	}
 
 	if task.LastCompletedAt != nil {
-		// If already completed inside the window for this month, skip.
 		if !task.LastCompletedAt.Before(start) && !task.LastCompletedAt.After(end) &&
 			task.LastCompletedAt.Month() == now.Month() && task.LastCompletedAt.Year() == now.Year() {
 			return false
@@ -119,32 +121,61 @@ func (s *ReminderService) recurringDue(task model.Task, now time.Time) bool {
 	return true
 }
 
-func formatTask(task model.Task, catNames map[uint]string) string {
+func formatTask(task model.Task, catNames map[uint]string, now time.Time) string {
 	var sb strings.Builder
-	sb.WriteString("• ")
-	sb.WriteString(task.Title)
-	if task.Description != "" {
-		sb.WriteString(fmt.Sprintf(" — %s", task.Description))
-	}
-	if task.CategoryID != nil {
-		if name, ok := catNames[*task.CategoryID]; ok {
-			sb.WriteString(fmt.Sprintf(" [раздел: %s]", name))
+
+	icon := "🟢"
+	if task.Deadline != nil {
+		d := task.Deadline.In(now.Location())
+		switch {
+		case now.After(d):
+			icon = "⚠️"
+		case d.Sub(now) <= 48*time.Hour:
+			icon = "⏳"
 		}
 	}
-	if task.Deadline != nil {
-		sb.WriteString(fmt.Sprintf(" (дедлайн: %s)", task.Deadline.Format("2006-01-02")))
+
+	title := html.EscapeString(strings.TrimSpace(task.Title))
+	sb.WriteString(fmt.Sprintf("%s %s", icon, title))
+
+	if task.CategoryID != nil {
+		if name, ok := catNames[*task.CategoryID]; ok {
+			trimmed := strings.TrimSpace(name)
+			if trimmed != "" {
+				sb.WriteString(fmt.Sprintf(" <i>(%s)</i>", html.EscapeString(trimmed)))
+			}
+		}
 	}
+
+	if task.Deadline != nil {
+		d := task.Deadline.In(now.Location())
+		if now.After(d) {
+			sb.WriteString(fmt.Sprintf("\n   ⏰ до %s — <b>просрочено</b>", d.Format("2006-01-02")))
+		} else {
+			daysLeft := int(d.Sub(now).Hours()/24) + 1
+			sb.WriteString(fmt.Sprintf("\n   ⏰ до %s · осталось ≈%d дн.", d.Format("2006-01-02"), daysLeft))
+		}
+	}
+
+	if task.Description != "" {
+		sb.WriteString(fmt.Sprintf("\n   📝 %s", html.EscapeString(strings.TrimSpace(task.Description))))
+	}
+
 	sb.WriteByte('\n')
 	return sb.String()
 }
 
 func formatRecurring(task model.Task, now time.Time, catNames map[uint]string) string {
 	var sb strings.Builder
-	sb.WriteString("• ")
-	sb.WriteString(task.Title)
+
+	sb.WriteString(fmt.Sprintf("♻️ %s", html.EscapeString(strings.TrimSpace(task.Title))))
+
 	if task.CategoryID != nil {
 		if name, ok := catNames[*task.CategoryID]; ok {
-			sb.WriteString(fmt.Sprintf(" [раздел: %s]", name))
+			trimmed := strings.TrimSpace(name)
+			if trimmed != "" {
+				sb.WriteString(fmt.Sprintf(" <i>(%s)</i>", html.EscapeString(trimmed)))
+			}
 		}
 	}
 
@@ -156,10 +187,13 @@ func formatRecurring(task model.Task, now time.Time, catNames map[uint]string) s
 	}
 	dueDate := time.Date(year, month, dueDay, 0, 0, 0, 0, now.Location())
 
-	sb.WriteString(fmt.Sprintf(" (дата: %s, окно ±%d дн.)", dueDate.Format("2006-01-02"), task.RecurWindow))
+	sb.WriteString(fmt.Sprintf("\n   📆 Ближайшая дата: %s (окно ±%d дн.)", dueDate.Format("2006-01-02"), task.RecurWindow))
 	if task.LastCompletedAt != nil {
-		sb.WriteString(fmt.Sprintf(" [выполнено: %s]", task.LastCompletedAt.Format("2006-01-02")))
+		sb.WriteString(fmt.Sprintf("\n   ✅ Последнее выполнение: %s", task.LastCompletedAt.In(now.Location()).Format("2006-01-02")))
+	} else {
+		sb.WriteString("\n   ✅ Пока не выполнялась")
 	}
+
 	sb.WriteByte('\n')
 	return sb.String()
 }

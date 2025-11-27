@@ -1,6 +1,8 @@
 package service
 
 import (
+	"context"
+
 	"daily-planner/internal/model"
 	"daily-planner/internal/repository"
 )
@@ -14,6 +16,6 @@ func NewCategoryService(repo *repository.CategoryRepository) *CategoryService {
 	return &CategoryService{repo: repo}
 }
 
-func (s *CategoryService) List(user *model.User) ([]model.Category, error) {
-	return s.repo.ListByUser(user.ID)
+func (s *CategoryService) List(ctx context.Context, user *model.User) ([]model.Category, error) {
+	return s.repo.ListByUser(ctx, user.ID)
 }
